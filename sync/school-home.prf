@@ -1,0 +1,32 @@
+# Unison profile: whole school account home, TWO-WAY between PC and stick.
+# Roots are passed by sync-now.sh at runtime (PC home <-> mounted stick).
+
+# Non-conflicting changes (file changed on only one side) sync automatically.
+auto = true
+batch = true
+
+# A file changed on BOTH sides is a CONFLICT. With no 'prefer' directive,
+# Unison touches neither copy: both versions survive and the run reports the
+# conflict. Never add 'prefer' here - that would silently pick a winner.
+
+# Before a file is overwritten or deleted because the other side is newer,
+# keep a backup copy. sync-now.sh passes -backupdir with a per-run folder.
+backup = Name *
+backuplocation = central
+
+# Keep modification times so 'what is newer' stays meaningful.
+times = true
+
+# Volatile / live application state is never synced (see docs/caveats.md).
+ignore = Path .cache
+ignore = Path .local/share/Trash
+ignore = Path .var/app/*/cache
+ignore = Name .unison
+ignore = Name .unison.*
+ignore = Name *.unison.tmp
+ignore = Name SingletonCookie
+ignore = Name SingletonLock
+ignore = Name SingletonSocket
+ignore = Name .parentlock
+ignore = Name parent.lock
+ignore = Name .~lock.*#
