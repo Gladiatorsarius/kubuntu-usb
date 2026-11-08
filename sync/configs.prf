@@ -1,0 +1,24 @@
+# Unison profile: selected config folders of your PERSONAL account, TWO-WAY.
+# Roots are passed by sync-now.sh; WHICH folders get synced comes from
+# config/folders.txt (passed as -path arguments). Edit that file, not this
+# one, to change what syncs.
+
+auto = true
+batch = true
+
+# Same conflict rule as the school profile: conflicts are flagged and left
+# alone, never auto-resolved.
+
+backup = Name *
+backuplocation = central
+times = true
+
+ignore = Name .unison
+ignore = Name .unison.*
+ignore = Name *.unison.tmp
+ignore = Name SingletonCookie
+ignore = Name SingletonLock
+ignore = Name SingletonSocket
+ignore = Name .parentlock
+ignore = Name .~lock.*#
+ignore = Path .config/kdeconnect/*.log
