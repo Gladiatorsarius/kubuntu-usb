@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
-/// Kubuntu 24.04 LTS (noble) desktop ISO.
+/// Kubuntu 24.04 LTS (noble) desktop ISO - latest point release in the
+/// 24.04 series (verified 200 on cdimage.ubuntu.com; the un-suffixed
+/// kubuntu-24.04-desktop-amd64.iso name 404s).
 pub const ISO_URL: &str =
-    "https://cdimage.ubuntu.com/kubuntu/releases/24.04/release/kubuntu-24.04-desktop-amd64.iso";
-pub const ISO_NAME: &str = "kubuntu-24.04-desktop-amd64.iso";
+    "https://cdimage.ubuntu.com/kubuntu/releases/24.04/release/kubuntu-24.04.5-desktop-amd64.iso";
+pub const ISO_NAME: &str = "kubuntu-24.04.5-desktop-amd64.iso";
 
 pub fn iso_path() -> PathBuf {
     crate::config::cache_dir().join(ISO_NAME)
