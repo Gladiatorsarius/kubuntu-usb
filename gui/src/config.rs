@@ -128,37 +128,11 @@ impl Settings {
     }
 }
 
-/// Local-style timestamp (YYYY-MM-DD HH:MM, UTC) for "last synced" and
-/// backup folder names. Pure Rust; the sandbox and target systems both
-/// lack a guaranteed `date` binary on the PATH we control.
+/// Local timestamp (YYYY-MM-DD HH:MM) for "last synced" and backup
+/// folder names. chrono resolves the local offset with its own TZif
+/// parsing (no libc localtime_r, so this is sound from any thread).
 pub fn timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    let days = secs.div_euclid(86_400);
-    let sod = secs.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
-        sod / 3600,
-        (sod % 3600) / 60
-    )
-}
-
-/// Days since the Unix epoch -> (year, month, day), proleptic Gregorian
-/// (Howard Hinnant's civil_from_days).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
 }
 
 #[cfg(test)]
@@ -173,12 +147,5 @@ mod timestamp_tests {
         assert_eq!(&ts[7..8], "-");
         assert_eq!(&ts[10..11], " ");
         assert_eq!(&ts[13..14], ":");
-    }
-
-    #[test]
-    fn epoch_boundaries() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(19_782), (2024, 2, 29)); // leap day
-        assert_eq!(civil_from_days(20_147), (2025, 2, 28));
     }
 }

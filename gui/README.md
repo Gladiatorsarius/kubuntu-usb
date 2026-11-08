@@ -28,6 +28,11 @@ ISO cache lives in `~/.cache/kubuntu-usb-sync/`.
 The Apps screen lists apt (`apt-mark showmanual`) and flatpak apps only -
 snap packages are not covered.
 
+The ISO is SHA256-verified against Ubuntu's published SHA256SUMS, but
+that file comes over the same HTTPS channel as the image and is not
+GPG-verified - this guards against corrupted downloads, not a
+compromised origin.
+
 The stick's filesystem label (`stick_label` in the config) is coupled to
 the udev rule: `packaging/etc/udev/rules.d/99-kubuntu-usb-sync.rules`
 matches `ID_FS_LABEL=="KUBUNTU-USB"`. Change the label in both places or

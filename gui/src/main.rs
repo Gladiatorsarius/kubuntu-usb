@@ -114,7 +114,8 @@ struct KubuntuUsbSyncApp {
     vm: Option<vm::VmHandle>,
     vm_status: Option<String>,
     sync_rx: Option<Receiver<unison::SyncEvent>>,
-    resolve_rx: Option<Receiver<ResolveOutcome>>,
+    /// One receiver per in-flight resolution; several can run at once.
+    resolve_rx: Vec<Receiver<ResolveOutcome>>,
     sync_profiles: Vec<PathBuf>,
     sync_roots: Option<(String, String)>,
     sync_running: bool,
@@ -168,7 +169,10 @@ impl KubuntuUsbSyncApp {
             demo_drives: flags.demo_drives,
             drives: Vec::new(),
             drives_rx: None,
-            drives_refreshed: Instant::now() - Duration::from_secs(10),
+            // checked_sub: plain subtraction can underflow right after boot.
+            drives_refreshed: Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
             selected_drive: None,
             drive_chooser_open: false,
             inventory_rx: Some(inventory_rx),
@@ -176,7 +180,7 @@ impl KubuntuUsbSyncApp {
             vm: None,
             vm_status: None,
             sync_rx: None,
-            resolve_rx: None,
+            resolve_rx: Vec::new(),
             sync_profiles: Vec::new(),
             sync_roots: None,
             sync_running: false,
@@ -302,7 +306,7 @@ impl KubuntuUsbSyncApp {
                 result,
             });
         });
-        self.resolve_rx = Some(rx);
+        self.resolve_rx.push(rx);
     }
 
     /// Drain backend channels and refresh drive info; called every frame.
@@ -379,15 +383,18 @@ impl KubuntuUsbSyncApp {
             if let Some(clean) = finished {
                 self.sync_running = false;
                 self.sync_rx = None;
+                // Prune after every run: chronic-conflict users produce
+                // the most backups and would never prune otherwise.
+                unison::prune_backups(&backup_root(), unison::BACKUP_RUNS_KEPT);
                 if clean {
                     self.last_synced = Some(config::timestamp());
-                    unison::prune_backups(&backup_root(), unison::BACKUP_RUNS_KEPT);
                     self.persist();
                 }
             }
         }
 
-        if let Some(rx) = &self.resolve_rx {
+        let mut pending = Vec::new();
+        for rx in std::mem::take(&mut self.resolve_rx) {
             match rx.try_recv() {
                 Ok(outcome) => {
                     let (profile, path) = &outcome.conflict;
@@ -404,32 +411,50 @@ impl KubuntuUsbSyncApp {
                                 .push(format!("Could not resolve {path}: {err}"));
                         }
                     }
-                    self.resolve_rx = None;
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => self.resolve_rx = None,
+                // A disconnected worker means its resolution was lost;
+                // the conflict stays in the list for another try.
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => pending.push(rx),
             }
         }
+        self.resolve_rx = pending;
 
         if let Some(rx) = &self.iso_rx {
             let mut close = false;
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    flash::DownloadEvent::Progress(bytes) => self.iso_bytes = bytes,
-                    flash::DownloadEvent::Verifying => self.iso_verifying = true,
-                    flash::DownloadEvent::Done(path) => {
-                        self.iso_downloading = false;
-                        self.iso_verifying = false;
-                        self.iso_size = std::fs::metadata(&path).ok().map(|m| m.len());
-                        close = true;
-                    }
-                    flash::DownloadEvent::Failed(msg) => {
-                        self.iso_downloading = false;
-                        self.iso_verifying = false;
-                        self.flash_status = Some(format!("ISO download failed: {msg}"));
-                        close = true;
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => match event {
+                        flash::DownloadEvent::Progress(bytes) => self.iso_bytes = bytes,
+                        flash::DownloadEvent::Verifying => self.iso_verifying = true,
+                        flash::DownloadEvent::Done(path) => {
+                            self.iso_downloading = false;
+                            self.iso_verifying = false;
+                            self.iso_size = std::fs::metadata(&path).ok().map(|m| m.len());
+                            close = true;
+                        }
+                        flash::DownloadEvent::Failed(msg) => {
+                            self.iso_downloading = false;
+                            self.iso_verifying = false;
+                            self.flash_status = Some(format!("ISO download failed: {msg}"));
+                            close = true;
+                        }
+                    },
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
                 }
+            }
+            // Same rule as the sync channel: no terminal event + closed
+            // channel means the worker died mid-flight.
+            if !close && disconnected && self.iso_downloading {
+                self.iso_downloading = false;
+                self.iso_verifying = false;
+                self.flash_status =
+                    Some("ISO download worker stopped unexpectedly.".into());
+                close = true;
             }
             if close {
                 self.iso_rx = None;
@@ -1547,11 +1572,11 @@ fn run_watch() -> i32 {
                 }
             }
             let _ = handle.join();
+            unison::prune_backups(&backup_root(), unison::BACKUP_RUNS_KEPT);
             if code == 0 {
                 let mut settings = settings;
                 settings.last_synced = Some(config::timestamp());
                 let _ = settings.save();
-                unison::prune_backups(&backup_root(), unison::BACKUP_RUNS_KEPT);
             }
             code
         }
