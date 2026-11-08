@@ -554,7 +554,7 @@ impl KubuntuUsbSyncApp {
                         .strong()
                         .color(ACCENT),
                 );
-                ui.label(RichText::new("UI prototype").small().color(TEXT_DIM));
+                ui.label(RichText::new("Sync & flash tool").small().color(TEXT_DIM));
                 ui.add_space(18.0);
 
                 for screen in Screen::ALL {
@@ -643,10 +643,15 @@ impl KubuntuUsbSyncApp {
         let mut dirty = false;
 
         let count = self.apps.iter().filter(|a| a.selected).count();
+        let summary = if count == 1 {
+            "1 app will be installed on the stick".to_string()
+        } else {
+            format!("{count} apps will be installed on the stick")
+        };
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("{count} apps will be installed on the stick"))
+                    RichText::new(summary)
                         .size(14.0)
                         .strong()
                         .color(ACCENT),
