@@ -14,6 +14,7 @@ use eframe::egui::{
     ScrollArea, Stroke, TextEdit, Vec2,
 };
 
+mod backend;
 mod config;
 
 use config::{FolderConfig as Folder, Settings, SyncMode as Mode};
