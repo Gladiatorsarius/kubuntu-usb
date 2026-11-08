@@ -228,7 +228,11 @@ fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         .corner_radius(CornerRadius::same(8))
         .stroke(Stroke::new(1.0_f32, BORDER))
         .inner_margin(Margin::same(14))
-        .show(ui, add_contents);
+        .show(ui, |ui| {
+            let w = ui.available_width();
+            ui.set_min_width(w);
+            add_contents(ui);
+        });
     ui.add_space(10.0);
 }
 
@@ -373,7 +377,7 @@ impl KubuntuUsbSyncApp {
                         if mode_button(ui, "PC wins", *mode == Mode::PcWins) {
                             self.folders[i].mode = Mode::PcWins;
                         }
-                        if mode_button(ui, "⇄ Both ways", *mode == Mode::BothWays) {
+                        if mode_button(ui, "↔ Both ways", *mode == Mode::BothWays) {
                             self.folders[i].mode = Mode::BothWays;
                         }
                     });
@@ -556,7 +560,7 @@ impl KubuntuUsbSyncApp {
 
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("●").color(GREEN));
+                ui.label(RichText::new("■").small().color(GREEN));
                 ui.label(
                     RichText::new("SanDisk Ultra 32 GB (/dev/sdb) detected")
                         .size(14.5)
