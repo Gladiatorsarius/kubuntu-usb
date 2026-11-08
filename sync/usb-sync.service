@@ -1,0 +1,13 @@
+# usb-sync.service - runs the sync once, triggered by the udev rule.
+# Install:  sudo cp usb-sync.service /etc/systemd/system/
+#           sudo cp -r sync /usr/local/bin/kubuntu-usb/   (see README step 3)
+#           sudo systemctl daemon-reload
+# (No 'systemctl enable' needed - udev starts it via SYSTEMD_WANTS.)
+[Unit]
+Description=Two-way sync with the KUBUNTU-USB stick
+After=local-fs.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+ExecStart=/usr/local/bin/kubuntu-usb/sync-now.sh
