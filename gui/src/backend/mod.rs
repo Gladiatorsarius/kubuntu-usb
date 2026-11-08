@@ -7,4 +7,8 @@ pub mod apps;
 #[allow(dead_code)]
 pub mod drives;
 #[allow(dead_code)]
+pub mod flash;
+#[allow(dead_code)]
 pub mod unison;
+#[allow(dead_code)]
+pub mod vm;
