@@ -14,6 +14,10 @@ use eframe::egui::{
     ScrollArea, Stroke, TextEdit, Vec2,
 };
 
+mod config;
+
+use config::{FolderConfig as Folder, Settings, SyncMode as Mode};
+
 // ---------------------------------------------------------------------------
 // KDE Breeze dark palette
 // ---------------------------------------------------------------------------
@@ -65,19 +69,6 @@ impl Screen {
 // ---------------------------------------------------------------------------
 // Dummy data
 // ---------------------------------------------------------------------------
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    BothWays,
-    PcWins,
-    StickWins,
-}
-
-struct Folder {
-    path: String,
-    description: String,
-    mode: Mode,
-}
-
 struct DummyApp {
     name: &'static str,
     flatpak: bool,
@@ -98,49 +89,59 @@ struct KubuntuUsbSyncApp {
     copy_user: String,
     auto_detect: bool,
     auto_sync: bool,
+    last_synced: Option<String>,
 }
 
 impl KubuntuUsbSyncApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_breeze_style(&cc.egui_ctx);
         let flags = Flags::parse();
+        let settings = Settings::load();
+        let selected = &settings.selected_apps;
+        let pick = |name: &str| selected.iter().any(|s| s.eq_ignore_ascii_case(name));
         Self {
             screen: flags.screen,
-            folders: vec![
-                Folder {
-                    path: "~/School".into(),
-                    description: "Notes, homework and presentations".into(),
-                    mode: Mode::BothWays,
-                },
-                Folder {
-                    path: "~/.config".into(),
-                    description: "Settings".into(),
-                    mode: Mode::PcWins,
-                },
-                Folder {
-                    path: "~/Projects".into(),
-                    description: "Code and assets".into(),
-                    mode: Mode::BothWays,
-                },
-            ],
+            folders: settings.folders.clone(),
             apps: vec![
-                DummyApp { name: "Firefox", flatpak: false, selected: true },
-                DummyApp { name: "Thunderbird", flatpak: false, selected: false },
-                DummyApp { name: "Kate", flatpak: false, selected: true },
-                DummyApp { name: "htop", flatpak: false, selected: true },
-                DummyApp { name: "git", flatpak: false, selected: false },
-                DummyApp { name: "VLC", flatpak: true, selected: true },
-                DummyApp { name: "GIMP", flatpak: true, selected: false },
-                DummyApp { name: "Discord", flatpak: true, selected: false },
-                DummyApp { name: "OBS Studio", flatpak: true, selected: false },
+                DummyApp { name: "Firefox", flatpak: false, selected: pick("Firefox") },
+                DummyApp { name: "Thunderbird", flatpak: false, selected: pick("Thunderbird") },
+                DummyApp { name: "Kate", flatpak: false, selected: pick("Kate") },
+                DummyApp { name: "htop", flatpak: false, selected: pick("htop") },
+                DummyApp { name: "git", flatpak: false, selected: pick("git") },
+                DummyApp { name: "VLC", flatpak: true, selected: pick("VLC") },
+                DummyApp { name: "GIMP", flatpak: true, selected: pick("GIMP") },
+                DummyApp { name: "Discord", flatpak: true, selected: pick("Discord") },
+                DummyApp { name: "OBS Studio", flatpak: true, selected: pick("OBS Studio") },
             ],
             add_dialog_open: flags.add_dialog,
             add_dialog_path: String::new(),
             erase_confirm_open: flags.erase_dialog,
             vm_running: flags.vm_running,
-            copy_user: "gladi".into(),
-            auto_detect: true,
-            auto_sync: false,
+            copy_user: settings.copy_user.clone(),
+            auto_detect: settings.auto_detect,
+            auto_sync: settings.auto_sync,
+            last_synced: settings.last_synced.clone(),
+        }
+    }
+
+    /// Write the current UI state back to the TOML config.
+    fn persist(&self) {
+        let settings = Settings {
+            folders: self.folders.clone(),
+            auto_detect: self.auto_detect,
+            auto_sync: self.auto_sync,
+            copy_user: self.copy_user.clone(),
+            selected_apps: self
+                .apps
+                .iter()
+                .filter(|app| app.selected)
+                .map(|app| app.name.to_string())
+                .collect(),
+            stick_label: "KUBUNTU-USB".into(),
+            last_synced: self.last_synced.clone(),
+        };
+        if let Err(err) = settings.save() {
+            eprintln!("settings: could not save: {err}");
         }
     }
 }
@@ -363,6 +364,7 @@ impl KubuntuUsbSyncApp {
             .map(|f| (f.path.clone(), f.description.clone(), f.mode))
             .collect();
 
+        let mut changed = false;
         for (i, (path, description, mode)) in snapshot.iter().enumerate() {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -377,12 +379,24 @@ impl KubuntuUsbSyncApp {
                         if mode_button(ui, "PC wins", *mode == Mode::PcWins) {
                             self.folders[i].mode = Mode::PcWins;
                         }
+                        if mode_button(ui, "Stick wins", *mode == Mode::StickWins) {
+                            self.folders[i].mode = Mode::StickWins;
+                            changed = true;
+                        }
+                        if mode_button(ui, "PC wins", *mode == Mode::PcWins) {
+                            self.folders[i].mode = Mode::PcWins;
+                            changed = true;
+                        }
                         if mode_button(ui, "↔ Both ways", *mode == Mode::BothWays) {
                             self.folders[i].mode = Mode::BothWays;
+                            changed = true;
                         }
                     });
                 });
             });
+        }
+        if changed {
+            self.persist();
         }
 
         let add = egui::Button::new(RichText::new("+ Add folder…").size(14.0).color(TEXT_DIM))
@@ -401,6 +415,7 @@ impl KubuntuUsbSyncApp {
             "Apps",
             "Pick the apps that should be installed on the stick.",
         );
+        let mut dirty = false;
 
         card(ui, |ui| {
             ui.label(
@@ -412,7 +427,12 @@ impl KubuntuUsbSyncApp {
             ui.label(RichText::new("System packages").small().color(TEXT_DIM));
             ui.add_space(6.0);
             for app in self.apps.iter_mut().filter(|a| !a.flatpak) {
-                ui.checkbox(&mut app.selected, RichText::new(app.name).size(14.0).color(TEXT));
+                if ui
+                    .checkbox(&mut app.selected, RichText::new(app.name).size(14.0).color(TEXT))
+                    .changed()
+                {
+                    dirty = true;
+                }
             }
         });
 
@@ -426,9 +446,17 @@ impl KubuntuUsbSyncApp {
             ui.label(RichText::new("From Flathub").small().color(TEXT_DIM));
             ui.add_space(6.0);
             for app in self.apps.iter_mut().filter(|a| a.flatpak) {
-                ui.checkbox(&mut app.selected, RichText::new(app.name).size(14.0).color(TEXT));
+                if ui
+                    .checkbox(&mut app.selected, RichText::new(app.name).size(14.0).color(TEXT))
+                    .changed()
+                {
+                    dirty = true;
+                }
             }
         });
+        if dirty {
+            self.persist();
+        }
 
         let count = self.apps.iter().filter(|a| a.selected).count();
         card(ui, |ui| {
@@ -531,12 +559,16 @@ impl KubuntuUsbSyncApp {
                     );
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Copy settings from user:").small().color(TEXT_DIM));
+                        let prev_user = self.copy_user.clone();
                         ComboBox::from_id_salt("copy_user")
                             .selected_text(self.copy_user.clone())
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.copy_user, "gladi".to_string(), "gladi");
                                 ui.selectable_value(&mut self.copy_user, "paul".to_string(), "paul");
                             });
+                        if self.copy_user != prev_user {
+                            self.persist();
+                        }
                     });
                 });
             });
@@ -632,7 +664,11 @@ impl KubuntuUsbSyncApp {
     fn show_sync(&mut self, ui: &mut egui::Ui) {
         page_heading(ui, "Sync", "Bring this PC and the stick to the same state.");
 
-        ui.label(RichText::new("Last synced: today 18:42").color(TEXT_DIM));
+        let last = self
+            .last_synced
+            .clone()
+            .unwrap_or_else(|| "never".to_string());
+        ui.label(RichText::new(format!("Last synced: {last}")).color(TEXT_DIM));
         ui.add_space(6.0);
         if ui
             .add(accent_button("Sync now", 48.0).min_size(Vec2::new(220.0, 48.0)))
@@ -689,6 +725,7 @@ impl KubuntuUsbSyncApp {
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
         page_heading(ui, "Settings", "How the app behaves.");
+        let before = (self.auto_detect, self.auto_sync);
 
         card(ui, |ui| {
             setting_toggle(
@@ -708,19 +745,27 @@ impl KubuntuUsbSyncApp {
             );
         });
 
+        if before != (self.auto_detect, self.auto_sync) {
+            self.persist();
+        }
+
         card(ui, |ui| {
             ui.label(RichText::new("Configuration").size(14.5).strong().color(TEXT));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Config file:").color(TEXT_DIM));
                 ui.label(
-                    RichText::new("~/.config/kubuntu-usb-sync/config.toml")
+                    RichText::new(config::config_path().display().to_string())
                         .monospace()
                         .color(TEXT),
                 );
             });
             ui.add_space(6.0);
-            ui.add(ghost_button("Open config folder"));
+            if ui.add(ghost_button("Open config folder")).clicked() {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(config::config_dir())
+                    .spawn();
+            }
         });
     }
 
@@ -750,6 +795,7 @@ impl KubuntuUsbSyncApp {
                                         description: "Added manually".into(),
                                         mode: Mode::BothWays,
                                     });
+                                    self.persist();
                                 }
                                 self.add_dialog_path.clear();
                                 self.add_dialog_open = false;
