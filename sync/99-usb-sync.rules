@@ -1,0 +1,6 @@
+# Auto-start the two-way sync when the KUBUNTU-USB stick is plugged in.
+# Install:  sudo cp 99-usb-sync.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload-rules
+# The stick's root filesystem must carry the label KUBUNTU-USB:
+#           sudo e2label /dev/sdX2 KUBUNTU-USB   (check the partition with lsblk)
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="KUBUNTU-USB", TAG+="systemd", ENV{SYSTEMD_WANTS}="usb-sync.service"
