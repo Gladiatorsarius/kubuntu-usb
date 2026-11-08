@@ -1,0 +1,11 @@
+[package]
+name = "kubuntu-usb-sync"
+version = "0.1.0"
+edition = "2021"
+description = "UI prototype for the Kubuntu USB sync tool (egui, UI only - no backend)"
+
+[dependencies]
+eframe = "0.31"
+
+[profile.dev]
+opt-level = 1
