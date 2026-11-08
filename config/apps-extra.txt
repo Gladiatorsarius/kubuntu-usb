@@ -1,0 +1,8 @@
+# apps-extra.txt - apps NOT in the apt list that you also want on the stick.
+# One per line. install-packages.sh handles the export automatically for
+# apt/snap/flatpak; this file is your manual "also remember" list, e.g.:
+# - AppImages and where you keep them
+# - tools installed via curl scripts (rustup, nvm, ...)
+# - IDE extensions to reinstall
+# Format: free text, one item per line. This file is documentation for
+# yourself, not executed.
