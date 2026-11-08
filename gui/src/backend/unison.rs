@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
+/// How many timestamped backup runs are kept under ~/.kubuntu-usb/backups.
+pub const BACKUP_RUNS_KEPT: usize = 10;
+
 /// Ignore rules shared by all generated profiles (from the repo's .prf files).
 const IGNORE_RULES: &[&str] = &[
     "Name .unison",
@@ -51,6 +54,18 @@ pub fn profile_for(folder: &FolderConfig, pc_home: &str, stick_home: &str) -> St
     profile
 }
 
+/// A folder path goes verbatim into a unison profile - reject anything
+/// that could break the line-based .prf format.
+fn validate_path(path: &str) -> std::io::Result<()> {
+    if path.chars().any(char::is_control) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("folder path contains control characters: {path:?}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Write all folder profiles into `dir` (one .prf per folder, name-sanitized).
 pub fn write_profiles(
     folders: &[FolderConfig],
@@ -61,6 +76,7 @@ pub fn write_profiles(
     std::fs::create_dir_all(dir)?;
     let mut written = Vec::new();
     for (index, folder) in folders.iter().enumerate() {
+        validate_path(&folder.path)?;
         let name: String = folder
             .path
             .trim_start_matches("~/")
@@ -79,30 +95,55 @@ pub fn write_profiles(
 pub enum SyncEvent {
     /// A status/action line from unison (e.g. "BGN Copying notes.txt ...").
     Line(String),
-    /// Unison reported a conflict for this path (left unresolved).
-    Conflict(String),
+    /// Unison reported a conflict for this path (left unresolved);
+    /// carries the index of the profile (i.e. folder) it came from.
+    Conflict { profile: usize, path: String },
     /// One profile finished; index into the folder list.
     FolderDone(usize),
-    /// Whole run finished; true when no conflicts were found.
+    /// Whole run finished; true when no conflicts or errors were found.
+    /// Always sent, including when unison could not be started.
     Finished(bool),
 }
 
 /// Run unison for every folder profile, streaming events to `tx`.
-/// Blocking - call from a worker thread.
-pub fn run_sync(
-    profiles: Vec<PathBuf>,
-    backup_dir: &Path,
-    tx: Sender<SyncEvent>,
-) -> std::io::Result<()> {
+/// Blocking - call from a worker thread. Never fails silently: a spawn
+/// error is reported as a Line and the run ends with Finished(false).
+pub fn run_sync(profiles: Vec<PathBuf>, backup_dir: &Path, tx: Sender<SyncEvent>) {
     let mut clean = true;
     for (index, profile) in profiles.iter().enumerate() {
-        let mut child = Command::new("unison")
+        let spawned = Command::new("unison")
             .arg(profile)
             .arg("-backupdir")
             .arg(backup_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                clean = false;
+                let _ = tx.send(SyncEvent::Line(format!(
+                    "could not start unison for {}: {err}",
+                    profile.display()
+                )));
+                let _ = tx.send(SyncEvent::FolderDone(index));
+                continue;
+            }
+        };
+
+        // Drain stderr on its own thread: a chatty unison can fill the
+        // pipe buffer and deadlock while we block reading stdout.
+        if let Some(stderr) = child.stderr.take() {
+            let tx_err = tx.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    if tx_err.send(SyncEvent::Line(format!("unison: {line}"))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
 
         if let Some(stdout) = child.stdout.take() {
             for line in BufReader::new(stdout).lines() {
@@ -115,19 +156,68 @@ pub fn run_sync(
                         .unwrap_or("")
                         .trim()
                         .to_string();
-                    let _ = tx.send(SyncEvent::Conflict(path));
+                    let _ = tx.send(SyncEvent::Conflict {
+                        profile: index,
+                        path,
+                    });
                 }
                 let _ = tx.send(SyncEvent::Line(line));
             }
         }
-        let status = child.wait()?;
-        if !status.success() {
-            clean = false;
+        match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                clean = false;
+                let _ = tx.send(SyncEvent::Line(format!(
+                    "unison exited with {status} for {}",
+                    profile.display()
+                )));
+            }
+            Err(err) => {
+                clean = false;
+                let _ = tx.send(SyncEvent::Line(format!("unison wait failed: {err}")));
+            }
         }
         let _ = tx.send(SyncEvent::FolderDone(index));
     }
     let _ = tx.send(SyncEvent::Finished(clean));
-    Ok(())
+}
+
+/// Resolve one conflict by re-running unison on that path with -prefer
+/// pointing at the winning root. Returns Err when unison fails or
+/// refuses; the caller keeps the conflict in the list in that case.
+pub fn resolve_conflict(profile: &Path, prefer_root: &str, path: &str) -> std::io::Result<()> {
+    let out = Command::new("unison")
+        .arg(profile)
+        .args(["-batch", "-prefer", prefer_root, "-path", path])
+        .output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "unison exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+/// Delete all but the newest `keep` timestamped backup run directories
+/// under `root` (names sort chronologically: YYYY-MM-DD_HH-MM).
+pub fn prune_backups(root: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut runs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    runs.sort();
+    let excess = runs.len().saturating_sub(keep);
+    for path in runs.into_iter().take(excess) {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +252,41 @@ mod tests {
     fn stick_wins_forces_stick_root() {
         let profile = profile_for(&folder(SyncMode::StickWins), "/home/gladi", "/media/usb/home");
         assert!(profile.contains("force = /media/usb/home/School"));
+    }
+
+    #[test]
+    fn control_chars_rejected() {
+        let mut bad = folder(SyncMode::BothWays);
+        bad.path = "~/School\nforce = /etc".into();
+        let dir = std::env::temp_dir().join(format!("kus-test-{}", std::process::id()));
+        let result = write_profiles(&[bad], "/home/a", "/media/b", &dir);
+        assert!(matches!(
+            result,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_keeps_newest_runs() {
+        let root = std::env::temp_dir().join(format!("kus-prune-{}", std::process::id()));
+        for name in [
+            "2025-01-01_10-00",
+            "2025-01-02_10-00",
+            "2025-01-03_10-00",
+            "2025-01-04_10-00",
+        ] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        prune_backups(&root, 2);
+        let left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&"2025-01-03_10-00".to_string()));
+        assert!(left.contains(&"2025-01-04_10-00".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

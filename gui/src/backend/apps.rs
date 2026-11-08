@@ -30,10 +30,63 @@ pub fn apt_manual() -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        // Drop library packages; nobody picks those intentionally.
-        .filter(|name| !name.starts_with("lib"))
+        .filter(|name| !looks_like_library(name))
         .map(str::to_string)
         .collect()
+}
+
+/// Shared-library packages are dependencies, not apps a user picks.
+/// A plain "starts with lib" filter also hides libreoffice-*, librecad
+/// and friends, so only drop names that look like versioned shared
+/// libs (libfoo2, libqt6core6t64, libbar-3) unless the package is a
+/// known app with a lib* name.
+fn looks_like_library(name: &str) -> bool {
+    /// lib-prefixed packages that are real applications.
+    const KNOWN_LIB_APPS: &[&str] = &[
+        "libreoffice",
+        "librecad",
+        "librewolf",
+        "librepcb",
+        "libresprite",
+    ];
+    let Some(rest) = name.strip_prefix("lib") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    if KNOWN_LIB_APPS
+        .iter()
+        .any(|app| name == *app || name.starts_with(&format!("{app}-")))
+    {
+        return false;
+    }
+    // Versioned soname packages (libpng16, libssl3t64, libqt6core6t64,
+    // libfoo-2) carry digits; the app names above do not.
+    rest.starts_with('-') || rest.chars().any(|c| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod lib_filter_tests {
+    use super::looks_like_library;
+
+    #[test]
+    fn drops_shared_libs_keeps_apps() {
+        for lib in ["libssl3", "libqt6core6t64", "libpng16-16t64", "libglib2.0-0t64"] {
+            assert!(looks_like_library(lib), "{lib} should be filtered");
+        }
+        for app in [
+            "libreoffice",
+            "libreoffice-core",
+            "libreoffice-writer",
+            "librecad",
+            "htop",
+            "firefox",
+            "git",
+        ] {
+            assert!(!looks_like_library(app), "{app} must stay visible");
+        }
+    }
 }
 
 /// Installed flatpak application IDs.

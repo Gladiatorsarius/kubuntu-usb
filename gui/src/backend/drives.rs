@@ -70,10 +70,10 @@ pub fn list_usb_drives() -> io::Result<Vec<UsbDrive>> {
         ])
         .output()?;
     if !out.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("lsblk failed: {}", String::from_utf8_lossy(&out.stderr)),
-        ));
+        return Err(io::Error::other(format!(
+            "lsblk failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
     }
     let parsed: Lsblk = serde_json::from_slice(&out.stdout)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;

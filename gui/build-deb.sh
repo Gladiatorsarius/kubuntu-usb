@@ -3,7 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="$(sed -n 's/^Version: //p' packaging/DEBIAN/control)"
+# The crate version is the single source of truth; the staged
+# control file is patched to match.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 STAGE="target/deb-stage"
 OUT="target/dist/kubuntu-usb-sync_${VERSION}_amd64.deb"
 
@@ -13,6 +15,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE" "$(dirname "$OUT")"
 cp -a packaging/. "$STAGE/"
 install -Dm755 target/release/kubuntu-usb-sync "$STAGE/usr/bin/kubuntu-usb-sync"
+sed -i "s/^Version: .*/Version: $VERSION/" "$STAGE/DEBIAN/control"
 
 # Permissions dpkg-deb will bake in.
 find "$STAGE" -type d -exec chmod 755 {} +

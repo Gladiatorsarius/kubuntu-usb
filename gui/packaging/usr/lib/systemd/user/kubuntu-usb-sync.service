@@ -3,5 +3,6 @@ Description=Kubuntu USB Sync watcher (auto-sync on stick plug-in)
 
 [Service]
 Type=oneshot
-TimeoutStartSec=1800
+# A big first sync can legitimately take hours; never kill it mid-write.
+TimeoutStartSec=0
 ExecStart=/usr/bin/kubuntu-usb-sync --watch

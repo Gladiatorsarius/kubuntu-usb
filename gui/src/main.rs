@@ -13,6 +13,7 @@
 //!   --erase-dialog                                 open the erase confirmation dialog
 //!   --vm-running                                   start the VM screen in "running" state
 //!   --demo-sync                                    demo progress + conflict on the Sync screen
+//!   --demo-drives                                  pretend a SanDisk Ultra stick is plugged in
 
 use eframe::egui::{
     self, Align, Color32, ComboBox, CornerRadius, Frame, Layout, Margin, ProgressBar, RichText,
@@ -22,10 +23,10 @@ use eframe::egui::{
 mod backend;
 mod config;
 
-use backend::{drives, flash, unison, vm};
+use backend::{apps, drives, flash, unison, vm};
 use config::{FolderConfig as Folder, Settings, SyncMode as Mode};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -79,7 +80,7 @@ impl Screen {
 // ---------------------------------------------------------------------------
 // Dummy data
 // ---------------------------------------------------------------------------
-struct DummyApp {
+struct AppEntry {
     name: String,
     flatpak: bool,
     selected: bool,
@@ -91,7 +92,7 @@ struct DummyApp {
 struct KubuntuUsbSyncApp {
     screen: Screen,
     folders: Vec<Folder>,
-    apps: Vec<DummyApp>,
+    apps: Vec<AppEntry>,
     add_dialog_open: bool,
     add_dialog_path: String,
     erase_confirm_open: bool,
@@ -100,26 +101,42 @@ struct KubuntuUsbSyncApp {
     auto_detect: bool,
     auto_sync: bool,
     last_synced: Option<String>,
+    stick_label: String,
+    demo_drives: bool,
     // ---- backend state ----
     drives: Vec<drives::UsbDrive>,
+    drives_rx: Option<Receiver<Vec<drives::UsbDrive>>>,
     drives_refreshed: Instant,
     selected_drive: Option<String>,
     drive_chooser_open: bool,
+    inventory_rx: Option<Receiver<Vec<apps::InventoryEntry>>>,
+    inventory_loaded: bool,
     vm: Option<vm::VmHandle>,
     vm_status: Option<String>,
     sync_rx: Option<Receiver<unison::SyncEvent>>,
+    resolve_rx: Option<Receiver<ResolveOutcome>>,
     sync_profiles: Vec<PathBuf>,
     sync_roots: Option<(String, String)>,
     sync_running: bool,
     sync_lines: Vec<String>,
-    sync_conflicts: Vec<String>,
+    /// (profile index, path) pairs reported by unison.
+    sync_conflicts: Vec<(usize, String)>,
     sync_done: usize,
     sync_total: usize,
     iso_rx: Option<Receiver<flash::DownloadEvent>>,
     iso_bytes: u64,
+    iso_size: Option<u64>,
     iso_downloading: bool,
+    iso_verifying: bool,
     flash_status: Option<String>,
     preseed_status: Option<String>,
+}
+
+/// Result of one Keep PC / Keep stick conflict resolution.
+struct ResolveOutcome {
+    conflict: (usize, String),
+    prefer_pc: bool,
+    result: Result<(), String>,
 }
 
 impl KubuntuUsbSyncApp {
@@ -127,33 +144,14 @@ impl KubuntuUsbSyncApp {
         apply_breeze_style(&cc.egui_ctx);
         let flags = Flags::parse();
         let settings = Settings::load();
-        let selected = &settings.selected_apps;
-        let pick = |name: &str| selected.iter().any(|s| s.eq_ignore_ascii_case(name));
-        // Real inventory from apt-mark + flatpak; fall back to the demo list.
-        let inventory = backend::apps::inventory();
-        let apps: Vec<DummyApp> = if inventory.is_empty() {
-            [
-                ("Firefox", false), ("Thunderbird", false), ("Kate", false),
-                ("htop", false), ("git", false), ("VLC", true), ("GIMP", true),
-                ("Discord", true), ("OBS Studio", true),
-            ]
-            .into_iter()
-            .map(|(name, flatpak)| DummyApp {
-                name: name.to_string(),
-                flatpak,
-                selected: pick(name),
-            })
-            .collect()
-        } else {
-            inventory
-                .into_iter()
-                .map(|entry| DummyApp {
-                    selected: pick(&entry.id),
-                    flatpak: entry.source == backend::apps::AppSource::Flatpak,
-                    name: entry.id,
-                })
-                .collect()
-        };
+        // Demo list until the real apt/flatpak inventory arrives from the
+        // startup worker (kept as the fallback when there is none).
+        let apps = build_apps(demo_inventory(), &settings.selected_apps);
+        let (inventory_tx, inventory_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = inventory_tx.send(apps::inventory());
+        });
+        let iso_size = std::fs::metadata(flash::iso_path()).ok().map(|m| m.len());
         Self {
             screen: flags.screen,
             folders: settings.folders.clone(),
@@ -166,13 +164,19 @@ impl KubuntuUsbSyncApp {
             auto_detect: settings.auto_detect,
             auto_sync: settings.auto_sync,
             last_synced: settings.last_synced.clone(),
-            drives: drives::list_usb_drives().unwrap_or_default(),
-            drives_refreshed: Instant::now(),
+            stick_label: settings.stick_label.clone(),
+            demo_drives: flags.demo_drives,
+            drives: Vec::new(),
+            drives_rx: None,
+            drives_refreshed: Instant::now() - Duration::from_secs(10),
             selected_drive: None,
             drive_chooser_open: false,
+            inventory_rx: Some(inventory_rx),
+            inventory_loaded: false,
             vm: None,
             vm_status: None,
             sync_rx: None,
+            resolve_rx: None,
             sync_profiles: Vec::new(),
             sync_roots: None,
             sync_running: false,
@@ -182,7 +186,9 @@ impl KubuntuUsbSyncApp {
             sync_total: 0,
             iso_rx: None,
             iso_bytes: 0,
+            iso_size,
             iso_downloading: false,
+            iso_verifying: false,
             flash_status: None,
             preseed_status: None,
         }
@@ -193,7 +199,7 @@ impl KubuntuUsbSyncApp {
     fn with_demo_sync(mut self, demo: bool) -> Self {
         if demo {
             self.sync_lines = vec!["Syncing ~/School … 120 of 184 files".into()];
-            self.sync_conflicts = vec!["School/notes.txt".into()];
+            self.sync_conflicts = vec![(0, "School/notes.txt".into())];
             self.sync_done = 65;
             self.sync_total = 100;
         }
@@ -213,7 +219,7 @@ impl KubuntuUsbSyncApp {
                 .filter(|app| app.selected)
                 .map(|app| app.name.to_string())
                 .collect(),
-            stick_label: "KUBUNTU-USB".into(),
+            stick_label: self.stick_label.clone(),
             last_synced: self.last_synced.clone(),
         };
         if let Err(err) = settings.save() {
@@ -221,12 +227,28 @@ impl KubuntuUsbSyncApp {
         }
     }
 
-    /// The drive the flash/VM screens act on: the picked one, else the first.
-    fn current_drive(&self) -> Option<&drives::UsbDrive> {
+    /// The drive the flash/VM screens act on: the picked one, else the
+    /// first detected, else the demo drive when --demo-drives is set.
+    fn current_drive(&self) -> Option<drives::UsbDrive> {
         self.selected_drive
             .as_ref()
             .and_then(|dev| self.drives.iter().find(|d| &d.device == dev))
             .or_else(|| self.drives.first())
+            .cloned()
+            .or_else(|| self.demo_drives.then(demo_drive))
+    }
+
+    /// Refresh the drive list on a worker thread (lsblk can take a moment;
+    /// never block the UI thread on it).
+    fn refresh_drives(&mut self) {
+        if self.drives_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(drives::list_usb_drives().unwrap_or_default());
+        });
+        self.drives_rx = Some(rx);
     }
 
     /// Kick off a real sync run in a worker thread.
@@ -234,97 +256,158 @@ impl KubuntuUsbSyncApp {
         if self.sync_running {
             return;
         }
-        let home = std::env::var("HOME").unwrap_or_default();
-        match drives::find_stick("KUBUNTU-USB") {
-            Ok(Some((_drive, _part, Some(mount)))) => {
-                let stick_home = format!("{mount}/home/{}", self.copy_user);
-                let dir = config::cache_dir().join("profiles");
-                match unison::write_profiles(&self.folders, &home, &stick_home, &dir) {
-                    Ok(profiles) => {
-                        self.sync_total = profiles.len();
-                        self.sync_done = 0;
-                        self.sync_lines.clear();
-                        self.sync_conflicts.clear();
-                        self.sync_roots = Some((home.clone(), stick_home));
-                        self.sync_profiles = profiles.clone();
-                        let backup_dir = PathBuf::from(&home)
-                            .join(".kubuntu-usb/backups")
-                            .join(timestamp().replace(' ', "_").replace(':', "-"));
-                        let (tx, rx) = mpsc::channel();
-                        std::thread::spawn(move || {
-                            let _ = unison::run_sync(profiles, &backup_dir, tx);
-                        });
-                        self.sync_rx = Some(rx);
-                        self.sync_running = true;
-                    }
-                    Err(err) => {
-                        self.sync_lines = vec![format!("could not write profiles: {err}")];
-                    }
-                }
-            }
-            Ok(Some((_drive, _part, None))) => {
-                self.sync_lines =
-                    vec!["Stick found but not mounted - mount it in Dolphin first.".into()];
-            }
-            Ok(None) => {
-                self.sync_lines =
-                    vec!["No stick with the label KUBUNTU-USB found - plug it in.".into()];
+        match prepare_sync(&self.folders, &self.copy_user, &self.stick_label) {
+            Ok(prep) => {
+                self.sync_total = prep.profiles.len();
+                self.sync_done = 0;
+                self.sync_lines.clear();
+                self.sync_conflicts.clear();
+                self.sync_roots = Some(prep.roots);
+                self.sync_profiles = prep.profiles.clone();
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    unison::run_sync(prep.profiles, &prep.backup_dir, tx);
+                });
+                self.sync_rx = Some(rx);
+                self.sync_running = true;
             }
             Err(err) => {
-                self.sync_lines = vec![format!("could not list drives: {err}")];
+                self.sync_lines = vec![err.to_string()];
             }
         }
     }
 
     /// Resolve one conflict by re-running unison on that path with -prefer.
+    /// The conflict is removed from the list only when unison confirms.
     fn resolve_conflict(&mut self, index: usize, prefer_pc: bool) {
+        let Some(conflict) = self.sync_conflicts.get(index).cloned() else {
+            return;
+        };
         let Some((pc_root, stick_root)) = self.sync_roots.clone() else {
             return;
         };
-        let Some(profile) = self.sync_profiles.first().cloned() else {
+        let Some(profile) = self.sync_profiles.get(conflict.0).cloned() else {
+            self.sync_lines
+                .push("internal error: no profile for that conflict".into());
             return;
         };
-        let path = self.sync_conflicts.remove(index);
         let root = if prefer_pc { pc_root } else { stick_root };
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = std::process::Command::new("unison")
-                .arg(profile)
-                .args(["-batch", "-prefer", &root, "-path", &path])
-                .output();
+            let result = unison::resolve_conflict(&profile, &root, &conflict.1)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(ResolveOutcome {
+                conflict,
+                prefer_pc,
+                result,
+            });
         });
+        self.resolve_rx = Some(rx);
     }
 
     /// Drain backend channels and refresh drive info; called every frame.
     fn poll_backend(&mut self, ctx: &egui::Context) {
+        // Startup inventory (apt-mark/flatpak) arrives from its worker.
+        if let Some(rx) = &self.inventory_rx {
+            match rx.try_recv() {
+                Ok(entries) => {
+                    self.inventory_loaded = true;
+                    if !entries.is_empty() {
+                        let selected = Settings::load().selected_apps;
+                        self.apps = build_apps(entries, &selected);
+                    }
+                    self.inventory_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.inventory_rx = None,
+            }
+        }
+
+        // Drive list refreshes on a worker; poll the result channel.
         if matches!(self.screen, Screen::FlashStick | Screen::VirtualMachine)
             && self.drives_refreshed.elapsed() > Duration::from_secs(3)
         {
-            self.drives = drives::list_usb_drives().unwrap_or_default();
+            self.refresh_drives();
             self.drives_refreshed = Instant::now();
+            if !self.iso_downloading {
+                self.iso_size = std::fs::metadata(flash::iso_path()).ok().map(|m| m.len());
+            }
+        }
+        if let Some(rx) = &self.drives_rx {
+            match rx.try_recv() {
+                Ok(drives) => {
+                    self.drives = drives;
+                    self.drives_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.drives_rx = None,
+            }
         }
 
         if let Some(rx) = &self.sync_rx {
             let mut finished = None;
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    unison::SyncEvent::Line(line) => {
-                        self.sync_lines.push(line);
-                        if self.sync_lines.len() > 200 {
-                            self.sync_lines.drain(..100);
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => match event {
+                        unison::SyncEvent::Line(line) => {
+                            self.sync_lines.push(line);
+                            if self.sync_lines.len() > 200 {
+                                self.sync_lines.drain(..100);
+                            }
                         }
+                        unison::SyncEvent::Conflict { profile, path } => {
+                            self.sync_conflicts.push((profile, path));
+                        }
+                        unison::SyncEvent::FolderDone(_) => self.sync_done += 1,
+                        unison::SyncEvent::Finished(clean) => finished = Some(clean),
+                    },
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
-                    unison::SyncEvent::Conflict(path) => self.sync_conflicts.push(path),
-                    unison::SyncEvent::FolderDone(_) => self.sync_done += 1,
-                    unison::SyncEvent::Finished(clean) => finished = Some(clean),
                 }
+            }
+            // The worker always sends Finished; if the channel closed
+            // without one, the worker died - stop waiting forever.
+            if finished.is_none() && disconnected && self.sync_running {
+                self.sync_lines
+                    .push("sync worker stopped unexpectedly".into());
+                finished = Some(false);
             }
             if let Some(clean) = finished {
                 self.sync_running = false;
                 self.sync_rx = None;
                 if clean {
-                    self.last_synced = Some(timestamp());
+                    self.last_synced = Some(config::timestamp());
+                    unison::prune_backups(&backup_root(), unison::BACKUP_RUNS_KEPT);
                     self.persist();
                 }
+            }
+        }
+
+        if let Some(rx) = &self.resolve_rx {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    let (profile, path) = &outcome.conflict;
+                    match outcome.result {
+                        Ok(()) => {
+                            self.sync_conflicts
+                                .retain(|c| c != &(*profile, path.clone()));
+                            let side = if outcome.prefer_pc { "PC" } else { "stick" };
+                            self.sync_lines
+                                .push(format!("Resolved {path} (kept the {side} copy)"));
+                        }
+                        Err(err) => {
+                            self.sync_lines
+                                .push(format!("Could not resolve {path}: {err}"));
+                        }
+                    }
+                    self.resolve_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.resolve_rx = None,
             }
         }
 
@@ -333,12 +416,16 @@ impl KubuntuUsbSyncApp {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     flash::DownloadEvent::Progress(bytes) => self.iso_bytes = bytes,
-                    flash::DownloadEvent::Done(_) => {
+                    flash::DownloadEvent::Verifying => self.iso_verifying = true,
+                    flash::DownloadEvent::Done(path) => {
                         self.iso_downloading = false;
+                        self.iso_verifying = false;
+                        self.iso_size = std::fs::metadata(&path).ok().map(|m| m.len());
                         close = true;
                     }
                     flash::DownloadEvent::Failed(msg) => {
                         self.iso_downloading = false;
+                        self.iso_verifying = false;
                         self.flash_status = Some(format!("ISO download failed: {msg}"));
                         close = true;
                     }
@@ -363,15 +450,119 @@ impl KubuntuUsbSyncApp {
     }
 }
 
-/// Local timestamp for "last synced" and backup folder names.
-fn timestamp() -> String {
-    std::process::Command::new("date")
-        .arg("+%Y-%m-%d %H:%M")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+/// Backup runs live under ~/.kubuntu-usb/backups/<timestamp>.
+fn backup_root() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".kubuntu-usb/backups")
+}
+
+/// Everything a sync run needs: written profiles, the PC/stick roots
+/// (for conflict resolution), and this run's backup directory.
+struct PreparedSync {
+    profiles: Vec<PathBuf>,
+    roots: (String, String),
+    backup_dir: PathBuf,
+}
+
+/// Why a sync cannot start.
+#[derive(Debug)]
+enum PrepError {
+    /// No stick with this label plugged in (not an error for the
+    /// --watch unit: plugging the stick in is what starts it).
+    NotFound(String),
+    NotMounted,
+    Other(String),
+}
+
+impl std::fmt::Display for PrepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrepError::NotFound(label) => {
+                write!(f, "No stick with the label {label} found - plug it in.")
+            }
+            PrepError::NotMounted => {
+                write!(f, "Stick found but not mounted - mount it in Dolphin first.")
+            }
+            PrepError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Shared sync setup for the GUI "Sync now" button and the --watch unit:
+/// locate the stick, write the unison profiles, name the backup dir.
+fn prepare_sync(
+    folders: &[Folder],
+    copy_user: &str,
+    stick_label: &str,
+) -> Result<PreparedSync, PrepError> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let (_drive, _part, mount) = drives::find_stick(stick_label)
+        .map_err(|err| PrepError::Other(format!("could not list drives: {err}")))?
+        .ok_or_else(|| PrepError::NotFound(stick_label.to_string()))?;
+    let mount = mount.ok_or(PrepError::NotMounted)?;
+    let stick_home = format!("{mount}/home/{copy_user}");
+    let dir = config::cache_dir().join("profiles");
+    let profiles = unison::write_profiles(folders, &home, &stick_home, &dir)
+        .map_err(|err| PrepError::Other(format!("could not write profiles: {err}")))?;
+    let backup_dir = backup_root().join(config::timestamp().replace(' ', "_").replace(':', "-"));
+    Ok(PreparedSync {
+        profiles,
+        roots: (home, stick_home),
+        backup_dir,
+    })
+}
+
+/// Placeholder stick for screenshots and demos (--demo-drives only).
+fn demo_drive() -> drives::UsbDrive {
+    drives::UsbDrive {
+        device: "/dev/sdb".into(),
+        model: "SanDisk Ultra".into(),
+        size_bytes: 34_359_738_368, // 32 GiB, matching the approved mock
+        partitions: Vec::new(),
+        mounted: false,
+    }
+}
+
+/// Demo inventory used until the real apt/flatpak list arrives, and as
+/// the fallback on systems without either.
+fn demo_inventory() -> Vec<apps::InventoryEntry> {
+    [
+        ("Firefox", false), ("Thunderbird", false), ("Kate", false),
+        ("htop", false), ("git", false), ("VLC", true), ("GIMP", true),
+        ("Discord", true), ("OBS Studio", true),
+    ]
+    .into_iter()
+    .map(|(name, flatpak)| apps::InventoryEntry {
+        id: name.to_string(),
+        source: if flatpak { apps::AppSource::Flatpak } else { apps::AppSource::Apt },
+    })
+    .collect()
+}
+
+/// Merge an inventory with the saved selection. Ticked apps that are
+/// not installed on this PC stay in the list (and in selected_apps) -
+/// they are meant for the stick, not for here.
+fn build_apps(entries: Vec<apps::InventoryEntry>, selected: &[String]) -> Vec<AppEntry> {
+    let pick = |name: &str| selected.iter().any(|s| s.eq_ignore_ascii_case(name));
+    let mut list: Vec<AppEntry> = entries
+        .into_iter()
+        .map(|entry| AppEntry {
+            selected: pick(&entry.id),
+            flatpak: entry.source == apps::AppSource::Flatpak,
+            name: entry.id,
+        })
+        .collect();
+    for name in selected {
+        if !list.iter().any(|app| app.name.eq_ignore_ascii_case(name)) {
+            // Flatpak IDs are dotted (org.videolan.VLC); apt names are not.
+            let flatpak = name.contains('.');
+            list.push(AppEntry {
+                name: name.clone(),
+                flatpak,
+                selected: true,
+            });
+        }
+    }
+    list
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +574,7 @@ struct Flags {
     erase_dialog: bool,
     vm_running: bool,
     demo_sync: bool,
+    demo_drives: bool,
 }
 
 impl Flags {
@@ -393,6 +585,7 @@ impl Flags {
             erase_dialog: false,
             vm_running: false,
             demo_sync: false,
+            demo_drives: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -414,6 +607,7 @@ impl Flags {
                 "--erase-dialog" => flags.erase_dialog = true,
                 "--vm-running" => flags.vm_running = true,
                 "--demo-sync" => flags.demo_sync = true,
+                "--demo-drives" => flags.demo_drives = true,
                 _ => {}
             }
         }
@@ -577,7 +771,7 @@ impl KubuntuUsbSyncApp {
                 }
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.label(RichText::new("v0.1.0").small().color(TEXT_DIM));
+                    ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small().color(TEXT_DIM));
                 });
             });
     }
@@ -589,30 +783,37 @@ impl KubuntuUsbSyncApp {
             "These folders stay in sync between this PC and the stick.",
         );
 
-        let snapshot: Vec<(String, String, Mode)> = self
-            .folders
-            .iter()
-            .map(|f| (f.path.clone(), f.description.clone(), f.mode))
-            .collect();
-
         let mut changed = false;
-        for (i, (path, description, mode)) in snapshot.iter().enumerate() {
+        for i in 0..self.folders.len() {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(path).size(15.0).strong().color(TEXT));
-                        ui.label(RichText::new(description).small().color(TEXT_DIM));
+                        ui.label(
+                            RichText::new(&self.folders[i].path)
+                                .size(15.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new(&self.folders[i].description)
+                                .small()
+                                .color(TEXT_DIM),
+                        );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if mode_button(ui, "Stick wins", *mode == Mode::StickWins) {
+                        if mode_button(ui, "Stick wins", self.folders[i].mode == Mode::StickWins) {
                             self.folders[i].mode = Mode::StickWins;
                             changed = true;
                         }
-                        if mode_button(ui, "PC wins", *mode == Mode::PcWins) {
+                        if mode_button(ui, "PC wins", self.folders[i].mode == Mode::PcWins) {
                             self.folders[i].mode = Mode::PcWins;
                             changed = true;
                         }
-                        if mode_button(ui, "↔ Both ways", *mode == Mode::BothWays) {
+                        if mode_button(
+                            ui,
+                            "↔ Both ways",
+                            self.folders[i].mode == Mode::BothWays,
+                        ) {
                             self.folders[i].mode = Mode::BothWays;
                             changed = true;
                         }
@@ -714,40 +915,50 @@ impl KubuntuUsbSyncApp {
             "Create a bootable Kubuntu stick with your apps and settings.",
         );
 
-        // Drive card: real detected drive, demo card as fallback.
-        let drive = self.current_drive().cloned();
-        let (name, device, size) = match &drive {
-            Some(d) => (
-                d.display_name(),
-                d.device.clone(),
-                format!("{:.0} GB", d.size_gib()),
-            ),
-            None => (
-                "SanDisk Ultra 32 GB".to_string(),
-                "/dev/sdb".to_string(),
-                "32 GB".to_string(),
-            ),
-        };
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(name).size(16.0).strong().color(TEXT));
-                    ui.label(RichText::new(device).monospace().color(TEXT_DIM));
+        // Drive card: the detected drive, or an honest empty state.
+        let drive = self.current_drive();
+        match &drive {
+            Some(d) => {
+                let (name, device, size) = (
+                    d.display_name(),
+                    d.device.clone(),
+                    format!("{:.0} GB", d.size_gib()),
+                );
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(name).size(16.0).strong().color(TEXT));
+                            ui.label(RichText::new(device).monospace().color(TEXT_DIM));
+                            ui.label(
+                                RichText::new("Everything on the stick will be erased.")
+                                    .small()
+                                    .color(DANGER),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(size).size(14.0).color(TEXT_DIM));
+                        });
+                    });
+                });
+            }
+            None => {
+                card(ui, |ui| {
                     ui.label(
-                        RichText::new("Everything on the stick will be erased.")
+                        RichText::new("No USB drive detected.")
+                            .size(15.0)
+                            .strong()
+                            .color(TEXT_DIM),
+                    );
+                    ui.label(
+                        RichText::new("Plug the stick in - it shows up here automatically.")
                             .small()
-                            .color(DANGER),
+                            .color(TEXT_DIM),
                     );
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(size).size(14.0).color(TEXT_DIM));
-                });
-            });
-        });
+            }
+        }
 
-        // Step 1 - ISO download (real cache check + real download)
-        let iso = flash::iso_path();
-        let iso_size = std::fs::metadata(&iso).ok().map(|m| m.len());
+        // Step 1 - ISO download (cached metadata + verified download)
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("1.").size(15.0).strong().color(TEXT_DIM));
@@ -758,15 +969,21 @@ impl KubuntuUsbSyncApp {
                             .strong()
                             .color(TEXT),
                     );
-                    if let Some(bytes) = iso_size.filter(|_| !self.iso_downloading) {
+                    if let Some(bytes) = self.iso_size.filter(|_| !self.iso_downloading) {
                         ui.label(
                             RichText::new(format!(
-                                "Done - the ISO is already downloaded ({:.1} GB)",
+                                "Done - the ISO is downloaded and verified ({:.1} GB)",
                                 bytes as f64 / 1e9
                             ))
                             .small()
                             .strong()
                             .color(GREEN),
+                        );
+                    } else if self.iso_verifying {
+                        ui.label(
+                            RichText::new("Verifying checksum ...")
+                                .small()
+                                .color(ACCENT),
                         );
                     } else if self.iso_downloading {
                         ui.label(
@@ -848,7 +1065,7 @@ impl KubuntuUsbSyncApp {
                         )
                         .clicked()
                     {
-                        match drives::find_stick("KUBUNTU-USB") {
+                        match drives::find_stick(&self.stick_label) {
                             Ok(Some((_d, _p, Some(mount)))) => {
                                 let pc_home =
                                     PathBuf::from(std::env::var("HOME").unwrap_or_default());
@@ -876,8 +1093,7 @@ impl KubuntuUsbSyncApp {
                 self.erase_confirm_open = true;
             }
             if ui.add(ghost_button("Choose different drive…")).clicked() {
-                self.drives = drives::list_usb_drives().unwrap_or_default();
-                self.drives_refreshed = Instant::now();
+                self.refresh_drives();
                 self.drive_chooser_open = true;
             }
         });
@@ -898,16 +1114,24 @@ impl KubuntuUsbSyncApp {
             "Test the stick in a VM before you boot from it for real.",
         );
 
-        let drive = self.current_drive().cloned();
+        let drive = self.current_drive();
         card(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Demo card when no stick is plugged in.
-                let label = match &drive {
-                    Some(d) => format!("{} ({}) detected", d.display_name(), d.device),
-                    None => "SanDisk Ultra 32 GB (/dev/sdb) detected".to_string(),
-                };
-                ui.label(RichText::new("■").small().color(GREEN));
-                ui.label(RichText::new(label).size(14.5).color(TEXT));
+            ui.horizontal(|ui| match &drive {
+                Some(d) => {
+                    ui.label(RichText::new("■").small().color(GREEN));
+                    ui.label(
+                        RichText::new(format!("{} ({}) detected", d.display_name(), d.device))
+                            .size(14.5)
+                            .color(TEXT),
+                    );
+                }
+                None => {
+                    ui.label(
+                        RichText::new("No USB drive detected - plug the stick in.")
+                            .size(14.5)
+                            .color(TEXT_DIM),
+                    );
+                }
             });
         });
 
@@ -928,7 +1152,7 @@ impl KubuntuUsbSyncApp {
                     handle.stop();
                 }
                 self.vm_running = false;
-            } else if let Some(drive) = self.current_drive().cloned() {
+            } else if let Some(drive) = self.current_drive() {
                 match vm::boot_stick(&drive) {
                     Ok(handle) => {
                         self.vm = Some(handle);
@@ -1044,7 +1268,7 @@ impl KubuntuUsbSyncApp {
                     .color(DANGER),
                 );
                 ui.add_space(4.0);
-                for (i, path) in self.sync_conflicts.iter().enumerate() {
+                for (i, (_profile, path)) in self.sync_conflicts.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
@@ -1116,6 +1340,19 @@ impl KubuntuUsbSyncApp {
                         .color(TEXT),
                 );
             });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Stick label:").color(TEXT_DIM));
+                ui.label(RichText::new(&self.stick_label).monospace().color(TEXT));
+            });
+            ui.label(
+                RichText::new(
+                    "The stick's filesystem label. If you change it in the config, update \
+                     the udev rule (99-kubuntu-usb-sync.rules) too - auto-sync on plug-in \
+                     matches this label.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
             ui.add_space(6.0);
             if ui.add(ghost_button("Open config folder")).clicked() {
                 let _ = std::process::Command::new("xdg-open")
@@ -1165,32 +1402,39 @@ impl KubuntuUsbSyncApp {
         }
 
         if self.erase_confirm_open {
-            let device = self
-                .current_drive()
-                .map(|d| d.device.clone())
-                .unwrap_or_else(|| "/dev/sdb".to_string());
+            let drive = self.current_drive();
             egui::Window::new("Erase stick?")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(
-                        RichText::new(format!("This will permanently erase {device}. Continue?"))
+                    match &drive {
+                        Some(d) => ui.label(
+                            RichText::new(format!(
+                                "This will permanently erase {}. Continue?",
+                                d.device
+                            ))
                             .size(14.0)
                             .color(TEXT),
-                    );
+                        ),
+                        None => ui.label(
+                            RichText::new("No USB drive detected - plug the stick in first.")
+                                .size(14.0)
+                                .color(DANGER),
+                        ),
+                    };
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add(danger_button("Erase").min_size(Vec2::new(80.0, 32.0)))
-                                .clicked()
+                            if drive.is_some()
+                                && ui
+                                    .add(danger_button("Erase").min_size(Vec2::new(80.0, 32.0)))
+                                    .clicked()
                             {
                                 self.erase_confirm_open = false;
-                                self.flash_status = None;
                                 let iso = flash::iso_path();
-                                match self.current_drive().cloned() {
-                                    Some(drive) if !iso.exists() => {
+                                match drive {
+                                    Some(drive) if self.iso_size.is_none() => {
                                         let _ = drive;
                                         self.flash_status =
                                             Some("Download the ISO first (step 1).".into());
@@ -1286,54 +1530,37 @@ fn run_watch() -> i32 {
         println!("auto-sync on plug-in is disabled in the settings");
         return 0;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    match drives::find_stick(&settings.stick_label) {
-        Ok(Some((_drive, _part, Some(mount)))) => {
-            let stick_home = format!("{mount}/home/{}", settings.copy_user);
-            let dir = config::cache_dir().join("profiles");
-            match unison::write_profiles(&settings.folders, &home, &stick_home, &dir) {
-                Ok(profiles) => {
-                    let (tx, rx) = mpsc::channel();
-                    let backup_dir = PathBuf::from(&home)
-                        .join(".kubuntu-usb/backups")
-                        .join(timestamp().replace(' ', "_").replace(':', "-"));
-                    let handle =
-                        std::thread::spawn(move || unison::run_sync(profiles, &backup_dir, tx));
-                    let mut code = 0;
-                    for event in rx {
-                        match event {
-                            unison::SyncEvent::Line(line) => println!("{line}"),
-                            unison::SyncEvent::Conflict(path) => println!("CONFLICT: {path}"),
-                            unison::SyncEvent::Finished(clean) => {
-                                code = if clean { 0 } else { 2 };
-                            }
-                            unison::SyncEvent::FolderDone(_) => {}
-                        }
+    match prepare_sync(&settings.folders, &settings.copy_user, &settings.stick_label) {
+        Ok(prep) => {
+            let (tx, rx) = mpsc::channel();
+            let handle =
+                std::thread::spawn(move || unison::run_sync(prep.profiles, &prep.backup_dir, tx));
+            let mut code = 0;
+            for event in rx {
+                match event {
+                    unison::SyncEvent::Line(line) => println!("{line}"),
+                    unison::SyncEvent::Conflict { path, .. } => println!("CONFLICT: {path}"),
+                    unison::SyncEvent::Finished(clean) => {
+                        code = if clean { 0 } else { 2 };
                     }
-                    let _ = handle.join();
-                    if code == 0 {
-                        let mut settings = settings;
-                        settings.last_synced = Some(timestamp());
-                        let _ = settings.save();
-                    }
-                    code
-                }
-                Err(err) => {
-                    eprintln!("could not write profiles: {err}");
-                    1
+                    unison::SyncEvent::FolderDone(_) => {}
                 }
             }
+            let _ = handle.join();
+            if code == 0 {
+                let mut settings = settings;
+                settings.last_synced = Some(config::timestamp());
+                let _ = settings.save();
+                unison::prune_backups(&backup_root(), unison::BACKUP_RUNS_KEPT);
+            }
+            code
         }
-        Ok(Some((_drive, _part, None))) => {
-            eprintln!("stick found but not mounted");
-            1
-        }
-        Ok(None) => {
-            println!("stick not found - nothing to do");
+        Err(PrepError::NotFound(label)) => {
+            println!("no stick with the label {label} found - nothing to do");
             0
         }
         Err(err) => {
-            eprintln!("could not list drives: {err}");
+            eprintln!("{err}");
             1
         }
     }
