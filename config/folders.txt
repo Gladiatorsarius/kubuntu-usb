@@ -1,0 +1,26 @@
+# folders.txt - which folders/files of your PERSONAL home sync both ways
+# with the stick (the "configs" profile). One per line, relative to home.
+# The school account is synced whole by the school-home profile; this list
+# is only for your personal settings. Add or remove lines freely.
+# Lines starting with # are comments.
+
+# KDE desktop: theme, panels, shortcuts, Dolphin settings
+.config/dolphinrc
+.config/kdeglobals
+.config/kwinrc
+.config/kwinrulesrc
+.config/kglobalshortcutsrc
+.config/plasma-org.kde.plasma.desktop-appletsrc
+.config/plasmashellrc
+.config/kscreenlockerrc
+.local/share/konsole
+
+# KDE Connect identity: keeps your phone paired to the same "device".
+.config/kdeconnect
+
+# App settings you probably want on both machines - uncomment what you use:
+#.config/Code/User/settings.json
+#.config/Code/User/keybindings.json
+#.config/git-credential-libsecret.config
+#.gitconfig
+#.ssh/config
