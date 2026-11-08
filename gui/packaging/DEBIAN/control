@@ -1,0 +1,15 @@
+Package: kubuntu-usb-sync
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: unison, qemu-system-x86, ovmf, curl
+Maintainer: Gladiatorsarius
+Description: Kubuntu USB stick sync, flash and VM tool
+ Turn a USB stick into a bootable Kubuntu drive that carries your apps
+ and KDE settings, and keep chosen folders in sync between the PC and
+ the stick (Unison based, conflicts flagged never overwritten).
+ .
+ Includes a udev rule that starts the sync watcher when the stick
+ (filesystem label KUBUNTU-USB) is plugged in, and a systemd --user
+ unit for the watcher.

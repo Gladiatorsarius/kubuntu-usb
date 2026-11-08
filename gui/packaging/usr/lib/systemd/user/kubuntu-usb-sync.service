@@ -1,0 +1,7 @@
+[Unit]
+Description=Kubuntu USB Sync watcher (auto-sync on stick plug-in)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+ExecStart=/usr/bin/kubuntu-usb-sync --watch
