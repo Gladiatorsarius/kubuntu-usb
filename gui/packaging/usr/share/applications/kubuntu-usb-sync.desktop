@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kubuntu USB Sync
+Comment=Flash a bootable Kubuntu USB stick and keep it in sync
+Exec=kubuntu-usb-sync
+Icon=media-removable
+Terminal=false
+Categories=Utility;System;
+Keywords=usb;sync;kubuntu;backup;unison;

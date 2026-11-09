@@ -1,0 +1,4 @@
+# Start the per-user sync watcher when the KUBUNTU-USB stick is plugged in.
+# The stick's root filesystem must carry the label KUBUNTU-USB:
+#   sudo e2label /dev/sdX2 KUBUNTU-USB
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="KUBUNTU-USB", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="kubuntu-usb-sync.service"
