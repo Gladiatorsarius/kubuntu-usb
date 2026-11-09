@@ -14,6 +14,13 @@ syncs itself with your home PC when you plug it back in.
 
 Works with Kubuntu 24.04 LTS or newer.
 
+## Desktop app
+
+`gui/` has kubuntu-usb-sync, a desktop app that automates all of this
+(sync, flashing, VM testing). Install instructions for the .deb package:
+[gui/README.md](gui/README.md#installing-the-deb). The manual
+shell-script workflow below still works and is what the app is based on.
+
 ## What you need
 
 - A 32 GB USB stick, USB 3 strongly recommended (the TARGET)

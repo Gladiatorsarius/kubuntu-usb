@@ -7,6 +7,52 @@ sync between the PC and the stick.
 Built with [egui](https://github.com/emilk/egui) (pure Rust), styled
 after KDE Breeze dark.
 
+## Installing the .deb
+
+1. Download `kubuntu-usb-sync_0.1.1_amd64.deb` (if it arrived as
+   `.deb.txt`, rename it back to `.deb` first).
+
+2. Install it with apt - not `dpkg -i` - so the dependencies are
+   resolved automatically:
+
+   ```sh
+   sudo apt install ./kubuntu-usb-sync_0.1.1_amd64.deb
+   ```
+
+   This pulls in the four runtime tools from the Kubuntu repos:
+   `unison`, `qemu-system-x86`, `ovmf`, `curl`.
+
+3. One-time setup for flashing and VM boot (raw stick access):
+
+   ```sh
+   sudo usermod -aG disk,kvm $USER
+   ```
+
+   Then log out and back in. Without this, flashing fails with a
+   permission error.
+
+4. For auto-sync on plug-in, the stick's root filesystem needs the
+   label `KUBUNTU-USB`:
+
+   ```sh
+   lsblk                              # find the stick's root partition
+   sudo e2label /dev/sdXN KUBUNTU-USB # use the real device
+   ```
+
+Nothing runs at install time and no service needs enabling: the package
+is just the binary (`/usr/bin/kubuntu-usb-sync`), the app-menu entry
+("Kubuntu USB Sync", under Utilities/System), a systemd *user* unit,
+and the udev rule that triggers it when the stick is plugged in. The
+watcher only runs while you are logged in, and auto-sync is off by
+default - flip it on in the app's Settings screen.
+
+Launch it from the app menu or by running `kubuntu-usb-sync`. First
+launch creates `~/.config/kubuntu-usb-sync/config.toml`.
+
+Remove it with `sudo apt remove kubuntu-usb-sync`; your config in
+`~/.config/kubuntu-usb-sync/` and the ISO cache in
+`~/.cache/kubuntu-usb-sync/` stay behind.
+
 ## Run
 
 ```sh
